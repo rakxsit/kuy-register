@@ -1,5 +1,5 @@
 # kuy-register
-Project on cue weighting of different register cues in Kuy, an Austroasiatic language of Thailand
+Project on cue weighting of different register cues in Kuy, an Austroasiatic language of Thailand. One published paper that came out of this project may be found at: https://www.degruyter.com/document/doi/10.1515/lingvan-2021-0042/pdf . A manuscript of another paper that is under revision may be found in the production > labphon_manuscript .
 
 In this project, you will find files from my project. The layout is as follows
 
