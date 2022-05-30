@@ -1,0 +1,723 @@
+---
+title: "Kuy Production Analysis"
+author: "Raksit T. Lau-Preechathammarach"
+last-updated: "9/1/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+# Conversion
+library(knitr)
+library(kableExtra)
+
+library(arm)        # For standardizing (Gelman 2008)
+library(hqmisc)     # For semitones to Hz conversion
+
+# Data wrangling
+library(tidyverse)
+
+# For PCA and correlations
+library(FactoMineR)
+library(factoextra) # Visualization
+library(corrplot)
+
+# Modeling
+library(lme4)       # For mixed models
+library(lmerTest)   # For mixed models
+library(splines)    # b-splines for non-linear data
+library(effects)    # For graphing effects
+library(jtools)     # To summarize nicely for printing
+
+# Grobs (visualize many factors)
+library(gtable)
+library(grid)
+
+library(rstudioapi)
+
+knitr::opts_chunk$set(root.dir = dirname(getActiveDocumentContext()$path),
+                      cache = TRUE, cache.lazy = TRUE, message = FALSE)
+
+##################
+# MODEL FUNCTION #
+##################
+
+# Run the model and create a dataframe with predicted results
+# Make dataframe for effects
+make_efdf <- function(df, model, fac1 = 'TLE', fac2 = 'away', splines = 3, timepoints = 20, sd = 1.5) {
+
+  # timepoints = # of timepoints we want to predict for
+  # sd = predict at +/- sd levels of fac1 and fac2
+  
+  # fac2 == FALSE if we do not include away
+
+  # To get the cutoffs
+  mean_fac1 <- mean(df[[fac1]])
+  sd_fac1 <- sd(df[[fac1]])
+    
+  # Levels for which we are estimating effects
+  l <- list(
+    time = 1:timepoints,
+    fac1 = c(mean_fac1-sd*sd_fac1, mean_fac1+sd*sd_fac1)
+  )
+  
+  term <- paste0('bs(time, df = ', splines, ')*register*gender*', fac1)
+  
+  if (fac2 != FALSE) {
+    
+    mean_fac2 <- mean(df[[fac2]])
+    sd_fac2 <- sd(df[[fac2]])
+    
+    l[[fac2]] <- c(mean_fac2-sd*sd_fac2, mean_fac2+sd*sd_fac2)
+    
+    term <- paste0(term, '*', fac2)
+    
+  }
+  
+  names(l) <- if (fac2 == FALSE) c('time', fac1) else c('time', fac1, fac2)
+  
+  ef <- as.data.frame(effect(term = term,
+                             xlevels = l,
+                             mod = model))
+  
+  # Make the breaks at these levels
+  if (fac2 == FALSE) { 
+    ef <- mutate(ef,
+                 !!fac1 := cut(ef[[fac1]],
+                               breaks = c(unique(ef[[fac1]])-.0001, max(unique(ef[[fac1]]) + .0001)),
+                               labels = c('less', 'greater'))
+                 )
+    } else {
+      ef <- mutate(ef,
+                   !!fac1 := cut(ef[[fac1]],
+                                 breaks = c(unique(ef[[fac1]])-.0001, max(unique(ef[[fac1]]) + .0001)),
+                                 labels = c('less', 'greater')),
+                   !!fac2 := cut(ef[[fac2]],
+                             breaks = c(unique(ef[[fac2]])-.0001, max(unique(ef[[fac2]]) + .0001)),
+                             labels = c('less', 'greater'))
+      )
+}
+
+  ef[[fac1]] <- factor(ef[[fac1]], levels = c('greater', 'less'))
+
+  return(ef)
+
+}
+
+# ##################
+# # GRAPH FUNCTION #
+# ##################
+# Graph function
+# xmin, xmax, ymin, ymax define the min and max limits of the x and y axes
+# alpha_ribbon changes how transparent the ribbon (confidence interval) is
+# text_sizes changes the size of the text
+#
+# The t_ functions refer to the top strip (Time Away)
+# The r_ functions refer to the right strip (TLE)
+#   top, bottom = Rows defining top and bottom of the strip--(1 is the bottom of the whole graph)
+#   left, right = Columns defining left and right of strip--(1 is the left of the whole graph)
+#   stripgap = Size of gap between strip and main graph
+#   size = Size of font
+#   stripgap = Size of gap between strip and main graph
+#   size = Size of font
+#
+#   rstrip_legend_gap = Size of gap between strip and legend
+#   col_gap = Size of gap between strip and levels
+#   raw = if TRUE, plot raw values
+#   convert_semi = if TRUE, convert semitones to Hz
+graph <- function(ef, meas, fac1 = 'TLE', fac1_title = 'Tonal Language Experience', 
+                  fac2 = 'away', fac2_title = 'Time Away',
+                  xmin = 0, xmax = 20, ymin = FALSE, ymax = FALSE, 
+                  alpha_ribbon = 0.25, text_sizes = 12,
+                  t_left = 5, t_right = 7, t_top = 7, t_bottom = 7, t_stripgap = 2/10, t_size = 1,
+                  r_left = 11, r_right = 12, r_top = 10, r_bottom = 12, r_stripgap = 2/10, r_size = 1, r_strippos = 10,
+                  rstrip_legend_gap = 5, col_gap = 10,
+                  gg_title = '', gg_titlesize = 20,
+                  raw = FALSE, convert_semi = FALSE) {
+  
+  # Dictionary to map measurements to labels
+  measure_text <- c('f0', 'H1*-H2*', 'H1*(-An*)', 'CPP', 'F1')
+  names(measure_text) <- c('f0_semitones', 'H1H2c', 'H1Anc_PC', 'CPP', 'F1_semitones')
+  
+  # Label for y-axis
+  ylabel <- c('Estimated', measure_text[meas])
+  
+  if (raw == TRUE) {
+      
+      if (meas %in% c('f0_semitones', 'F1_semitones')) {
+        
+        ifelse(convert_semi, ylabel <- c(ylabel, '(Hz)'), ylabel <- c(ylabel, '(semitones)'))
+        
+      } else {
+        
+        ylabel <- c(ylabel, '(dB)')
+        
+      }
+   
+  } else {
+    
+      ylabel <- c(ylabel, '(scaled)')
+    
+  }
+  
+  y <- ifelse(raw, 'fit_raw', 'fit')
+  lower_y <- ifelse(raw, 'lower_raw', 'lower')
+  upper_y <- ifelse(raw, 'upper_raw', 'upper')
+  
+  if ((meas %in% c('f0_semitones', 'F1_semitones')) & (convert_semi == TRUE)) {
+    
+    y <- paste0(y, '_Hz')
+    lower_y <- paste0(lower_y, '_Hz')
+    upper_y <- paste0(upper_y, '_Hz')
+      
+  }
+  
+  # Set up the basic plot
+  p <- ggplot(ef, aes_string(x = 'time', y = y, color = 'register')) +
+    geom_line() +
+    geom_ribbon(aes_string(ymin = lower_y, ymax = upper_y, fill = 'register'), alpha = alpha_ribbon, color = NA) +
+    xlim(xmin,xmax)
+  
+  if ((ymin != FALSE) || (ymax != FALSE)) {
+    p <- p + ylim(ymin, ymax)
+  }
+  
+  p <- p + 
+    labs(x = 'Normalized Time',
+         y = paste(ylabel, collapse = ' ')) +
+    facet_grid(reformulate(fac2, fac1)) +
+    ggtitle(gg_title) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5,
+                                    size = gg_titlesize, face = 'bold'),
+          text = element_text(size = text_sizes),
+          legend.position = 'none') +
+    scale_fill_brewer(name = 'Register', palette = 'Set1') +
+    scale_color_brewer(name = 'Register', palette = 'Set1')
+  
+  #############################
+  # Now add strips with grobs #
+  #############################
+  z <- ggplotGrob(p)
+  
+  #  New strip at the top
+  z <- gtable_add_rows(z, z$height[7], pos = 6)  # New row added below row 6
+  
+  z <- gtable_add_grob(z,
+                       list(rectGrob(gp = gpar(col = NA, fill = "gray85", size = .5)),
+                            textGrob(fac2_title,
+                                     gp = gpar(cex = t_size, fontface = 'bold', col = "black"))),
+                       t=t_top, l=t_left, b=t_bottom, r=t_right, name = c("a", "b"))
+  
+  # Add small gap between strips - below row 6
+  z <- gtable_add_rows(z, unit(t_stripgap, "line"), 7)
+  
+  #########
+  
+  #  New strip to the right
+  z <- gtable_add_cols(z, unit(rstrip_legend_gap, 'pt'), pos = r_strippos)
+  
+  # Check the layout
+  # New strip spans rows 7 to 11
+  z <- gtable_add_grob(z,
+                       list(rectGrob(gp = gpar(col = NA, fill = "gray85", size = .5)),
+                            textGrob(fac1_title, rot = -90,
+                                     gp = gpar(cex = r_size, fontface = 'bold', col = "black"))),
+                       t=r_top, l=r_left, b=r_bottom, r=r_right, name = c("a", "b"))
+  
+  # Add small gap between strips - to the right of column 6
+  z <- gtable_add_cols(z, unit(r_stripgap, "line"), col_gap)
+  
+  return(z)
+  
+}
+```
+
+# Read in data and scale for comparability
+
+```{r readdata, cache=TRUE, message=FALSE}
+df <- read_csv('../0_data/kuy-production-clean.csv')
+
+# Speaker number is not on a scale
+df$sp <- as.character(df$sp)
+
+# Vowel heights
+heights <- c('high', 'high', 'mid-high', 'mid-high', 'mid-low', 'low', 'low')
+names(heights) <- c('ii', 'uu', 'ee', 'oo', 'EE', 'a', 'A')
+
+df$vheight <- heights[df$vowelqual]
+
+# Rescale the means by speaker
+for (meas in c('f0', 'f0_semitones', 'H1c', 'H1H2c', 'H1A1c', 'H1A2c', 'H1A3c', 'CPP', 'F1', 'F1_semitones')) {
+  
+  varname <- paste(meas, 'scaled', sep = '_')
+
+  # If F1, scale by height too
+  if (meas %in% c('F1', 'F1_semitones')) {
+
+    df <- as.data.frame(df %>%
+                          group_by(sp, vheight) %>%
+                          mutate(!!varname := arm::rescale(get(meas))) %>%
+                          ungroup())
+  } else {
+
+  df <- as.data.frame(df %>%
+                        group_by(sp) %>%
+                        mutate(!!varname := arm::rescale(get(meas))) %>%
+                        ungroup())
+
+  }
+  
+}
+```
+
+```{r rmd, include = FALSE}
+# If Rmd is true, all info will be presented for knitting
+
+rmd <- TRUE
+
+measures <- c('F0_semitones', 'H1H2c', 'H1Anc_PC', 'CPP', 'F1_semitones')
+```
+
+# Run PCA on acoustic correlates of voice quality
+
+```{r pca, cache = TRUE}
+# Subset for PCA
+pca_df <- df %>% dplyr::select(H1c_scaled, H1H2c_scaled, H1A1c_scaled, H1A2c_scaled, H1A3c_scaled, CPP_scaled)
+
+# Change column names
+colnames(pca_df) <- c('H1*', 'H1* - H2*', 'H1* - A1*', 'H1* - A2*', 'H1* - A3*', 'CPP')
+
+# Look at correlations (unncomment commands below if want to produce graphics)
+#bitmap('vqual-corr.tiff', height = 8, width = 8, units = 'in', type = 'tifflzw', res = 300)
+#postscript("vqual-corr.eps", height = 8, width = 8, paper = 'special')
+# pdf('vqual-corr.pdf', height = 8, width = 8)
+corrplot(cor(pca_df), method = 'circle', diag = FALSE, type = 'upper', addCoef.col = 'black')
+# dev.off()
+
+# Run PCA
+vq.pca <- PCA(pca_df, graph = FALSE, ncp = 6)
+
+# Scree plot (unncomment commands below if want to produce graphics)
+#bitmap('vqual-scree.tiff', height = 4, width = 6, units = 'in', type = 'tifflzw', res = 300)
+#postscript("vqual-scree.eps", height = 4, width = 6, paper = 'special')
+# pdf('vqual-scree.pdf', height = 4, width = 6)
+fviz_screeplot(vq.pca, addlabels = FALSE, title = '') +
+  geom_text(aes(label = round(vq.pca$eig[, 2], 2)), size = 5, hjust = 0.1, vjust = -0.5) +
+  theme(text = element_text(size = 15)) +
+  ylim(0,45)
+# dev.off()
+
+# Contributions to dimension 1 (unncomment commands below if want to produce graphics)
+#bitmap('vqual-dim1.tiff', height = 4, width = 6, units = 'in', type = 'tifflzw', res = 300)
+#postscript("vqual-dim1.eps", height = 4, width = 6, paper = 'special')
+# pdf('vqual-dim1.pdf', height = 4, width = 6)
+p <- fviz_contrib(vq.pca, choice = "var", title = '', axes = 1) +
+  geom_text(aes(label = round(contrib, 2)), vjust = -1, size = 5) +
+  theme(axis.text = element_text(size = 15),
+        axis.title = element_text(size = 15)) +
+  ylim(0, 35)
+p$layers[[2]] <- NULL
+p
+# dev.off()
+
+```
+
+
+```{r addpca, cache=TRUE}
+# Add dimension 1 to data frame and rescale
+df$H1Anc_PC <- vq.pca$ind$coord[, 1]
+df$H1Anc_PC_scaled <- arm::rescale(df$H1Anc_PC)
+
+# Save H1Anc_PC values for use with LDA
+write.csv(df, '../0_data/kuy-production-clean.csv', row.names = FALSE)
+
+# Also turn experiencePC to TLE (Tonal Language Experience)
+# And transform years away as it is right skewed, and then scale it
+dem <- read_csv('../0_data/kuy-production-dem.csv')
+
+dem$TLE <- arm::rescale(-dem$experiencePC)
+dem$away <- arm::rescale(sqrt(dem$yearsaway))
+
+# Update demographic info
+write.csv(dem, '../0_data/kuy-production-dem.csv', row.names = FALSE)
+
+# Merge with main df for model
+df <- merge(df, dem, by = 'sp')
+
+```
+
+# Models
+
+### Measures
+- f0: fundamental frequency (can add _semitones)
+- H1H2c: H1\*-H2*
+- H1Anc_PC: PC corresponding largely to H1* and H1\*-An*
+- CPP: Cepstral Peak Prominence
+- F1_byheight: first formant (can add _semitones before _byheight)
+
+```{r model, cache=TRUE, include=FALSE}
+models = list()
+
+fac1 <- 'TLE'
+fac2 <- 'away'
+splines <- 3
+randef <- '(1|sp) + (1|word)'
+
+measures <- c('f0_semitones', 'H1H2c', 'H1Anc_PC', 'CPP', 'F1_semitones')
+
+# Run linear regression
+for (m in measures) {
+  
+  m_scaled <- paste0(m, '_scaled')
+  
+  print(paste0('Running model for ', m, '...'))
+  
+  models[[m]] <- lmer(as.formula(paste0(m_scaled, ' ~ bs(time, df = ', splines, ')*register*gender*', fac1, '*', fac2, ' + ', randef)), data = df, control=lmerControl(optimizer = "bobyqa"), REML = FALSE)
+  
+}
+
+```
+
+# Effects
+
+```{r effects, cache=TRUE}
+efs = list()
+
+# Get effect df from model
+for (m in measures) {
+  
+  print(paste0('Estimating effects for ', m, '...'))
+  
+  if (m %in% c('H1H2c', 'F1_semitones')) {
+    efs[[m]] <- make_efdf(df = df, model = models[[m]], fac1 = fac1, fac2 = FALSE, splines = 3, timepoints = 20, sd = 1.5)
+  } else {
+    efs[[m]] <- make_efdf(df = df, model = models[[m]], fac1 = fac1, fac2 = fac2, splines = 3, timepoints = 20, sd = 1.5)
+  }
+  
+}
+
+```
+
+# Get means and SDs for each measure
+
+```{r meansd, cache=TRUE}
+# Dictionary for summary statistics
+sumstats = list()
+
+for (m in measures) {
+  
+  if (m == 'F1_semitones') {
+    
+    sumstats[[paste0(m, '_sumstats')]] <- df %>%
+    group_by(gender, sp, vheight) %>%
+    summarize(mean = mean(get(m)),
+              sd = sd(get(m)))
+    
+  } else {
+    
+    sumstats[[paste0(m, '_sumstats')]] <- df %>%
+    group_by(gender, sp) %>%
+    summarize(mean = mean(get(m)),
+              sd = sd(get(m)))
+  }
+  
+}
+```
+
+# Convert effect df scaled values back to raw
+
+```{r converteffects, cache=TRUE}
+#  mean + 2 * sd * value
+
+est <- c('fit', 'se', 'upper', 'lower')
+
+# Dictionary of efs for graphing
+ef_graph <- list()
+
+# We need effects for each measure for each gender
+for (m in measures) {
+  
+  # Get ef and sumstats
+  efdf <- efs[[m]]
+  ssdf <- sumstats[[paste(m, 'sumstats', sep = '_')]]
+  
+  # If F1, we need to subset by each height
+  if (m == 'F1_semitones') {
+    
+    for (h in c('high', 'mid-high', 'mid-low', 'low')) {
+      
+      # Make subsetted df for height
+      subefname <- paste(c(m, h), collapse = '_')
+      
+      ef_graph[[subefname]] <- efdf
+      
+      # Transform to raw values
+      ef_graph[[subefname]][paste(est, 'raw', sep = '_')] <- 
+        lapply(ef_graph[[subefname]][est], function (x)
+          mean(ssdf[ssdf$gender == g & ssdf$vheight == h, ]$mean) + 
+          2 * mean(ssdf[ssdf$gender == g & ssdf$vheight == h, ]$sd) * x)
+       
+      # Transform to Hz
+      ef_graph[[subefname]][paste(est, 'raw', 'Hz', sep = '_')] <-
+        lapply(ef_graph[[subefname]][paste(est, 'raw', sep = '_')], function (x) st2f(x, base = 75))
+      
+    }
+  
+  } else if (m == 'H1H2c') {
+    
+    ef_graph[[m]] <- efdf
+    
+    # Transform to raw values
+    ef_graph[[m]][paste(est, 'raw', sep = '_')] <- 
+      lapply(ef_graph[[m]][est], function (x)
+        mean(ssdf[ssdf$gender == g, ]$mean) + 
+        2 * mean(ssdf[ssdf$gender == g , ]$sd) * x)
+    
+  } else {
+  
+    for (g in c('f', 'm')) {
+       
+        # Make subsetted df for gender
+        subefname <- paste(c(m, g), collapse = '_')
+        
+        ef_graph[[subefname]] <- efdf[efdf$gender == g, ]
+        
+        # Transform to raw values
+        ef_graph[[subefname]][paste(est, 'raw', sep = '_')] <- 
+          lapply(ef_graph[[subefname]][est], function (x)
+            mean(ssdf[ssdf$gender == g, ]$mean) + 
+            2 * mean(ssdf[ssdf$gender == g , ]$sd) * x)
+        
+        # Transform to Hz
+        ef_graph[[subefname]][paste(est, 'raw', 'Hz', sep = '_')] <- 
+          lapply(ef_graph[[subefname]][paste(est, 'raw', sep = '_')], function (x) st2f(x, base = 75))
+          
+    }
+  
+  }
+    
+}
+
+```
+
+# Graph effects for 5-way interactions that are significant
+
+```{r graph}
+for (m in measures) {
+  
+  raw <- ifelse(m %in% c('H1Anc_PC', 'F1_semitones'), FALSE, TRUE)
+  ymin <- ifelse(m %in% c('H1Anc_PC', 'F1_semitones'), -1, FALSE)
+  ymax <- ifelse(m %in% c('H1Anc_PC', 'F1_semitones'), 1, FALSE)
+  convert_semi <- ifelse(m == 'f0_semitones', TRUE, FALSE)
+  
+  if (m == 'F1_semitones') {
+    
+    for (h in c('high', 'mid-high', 'mid-low', 'low')) {
+
+          print(paste(m, h, collapse = ', '))
+
+          z <- graph(ef = ef_graph[[paste(m, h, sep = '_')]], meas = m,
+               fac1 = fac1, fac1_title = 'Tonal Language Experience',
+               fac2 = 'gender', fac2_title = 'Gender', gg_title = '',
+               raw = raw, convert_semi = convert_semi,
+               ymin = ymin, ymax = ymax,
+               r_left = 11, r_right = 12, rstrip_legend_gap = 20,
+               text_sizes = 18, t_size = 1.25, r_size = 1)
+
+          pdf(paste0(m, '-', h, '.pdf'), height = 4, width = 6)
+          grid.newpage()
+          grid.draw(z)
+          dev.off()
+
+    }
+    
+  } else if (m == 'H1H2c') {
+    
+    print(m)
+    
+    z <- graph(ef = ef_graph[[m]], meas = m,
+               fac1 = fac1, fac1_title = 'Tonal Language Experience',
+               fac2 = 'gender', fac2_title = 'Gender', gg_title = '',
+               raw = raw, convert_semi = convert_semi,
+               ymin = ymin, ymax = ymax,
+               r_left = 11, r_right = 12, rstrip_legend_gap = 20,
+               text_sizes = 18, t_size = 1.25, r_size = 1)
+  
+        pdf(paste0(m, '-', g, '.pdf'), height = 4, width = 6)
+        grid.newpage()
+        grid.draw(z)
+        dev.off()
+    
+  } else {
+  
+    for (g in c('f', 'm')) {
+      
+      print(paste(m, g, collapse = ', '))
+    
+      z <- graph(ef = ef_graph[[paste(m, g, sep = '_')]], meas = m,
+             fac1 = fac1, fac1_title = 'Tonal Language Experience',
+             fac2 = fac2, fac2_title = 'Time Away', gg_title = '',
+             raw = raw, convert_semi = convert_semi,
+             ymin = ymin, ymax = ymax,
+             r_left = 11, r_right = 12, rstrip_legend_gap = 20,
+             text_sizes = 18, t_size = 1.25, r_size = 1)
+
+      pdf(paste0(m, '-', g, '.pdf'), height = 4, width = 6)
+      grid.newpage()
+      grid.draw(z)
+      dev.off()
+  
+    }
+  
+  }
+
+}
+
+
+
+```
+# Summarize models
+Choose a model in the models list to summarize
+
+```{r summodel}
+mod <- models$f0_semitones
+
+rmd <- TRUE
+
+if (rmd == TRUE) {
+  for (meas in measures) {
+    print(meas)
+    print(kable(summ(models[[meas]])$coeftable, format = 'markdown'))
+  }
+} else {
+  print(meas)
+  print(kable(summ(mod)$coeftable, format = 'markdown', digits = 2))
+}
+
+```
+
+# Summarize trajectory differences
+Choose 
+- measure: f0_semitones, H1H2c, H1Anc_PC, CPP, F1_semitones
+- gender: f, m
+- optionally vowel height: high, mid-high, mid-low, low
+Must add _ before gender and height. If not F1_semitones, this should be blank: ''
+
+```{r convertraw, warning=FALSE}
+# m <- 'H1H2c'
+# g <- '_m'
+# h <- ''
+
+if (rmd == TRUE) {
+  for (m in measures) {
+    
+      raw <- ifelse(substr(m, 0, 2) %in% c('f0', 'F1'), 'fit_raw_Hz', 'fit_raw')
+      
+      if (grepl('F1', m, fixed = TRUE)) {
+        for (h in c('high', 'mid-high', 'mid-low', 'low')) {
+          raw <- ifelse(substr(m, 0, 2) %in% c('f0', 'F1'), 'fit_raw_Hz', 'fit_raw')
+          
+          sumest <- ef_graph[[paste(m, h, sep = '_')]] %>%
+          group_by(gender, TLE, register) %>%
+          summarize(mean_scaled = mean(fit),
+                    mean_raw = mean(get(raw)))
+          
+          sumdiff <- sumest[sumest$register == 'modal', ]
+          
+          sumdiff$mbdiff_raw <- sumdiff$mean_raw - sumest[sumest$register == 'breathy', ]$mean_raw
+          
+          sumdiff$mbdiff_scaled <- sumdiff$mean_scaled - sumest[sumest$register == 'breathy', ]$mean_scaled
+          
+          sumdiff <- sumdiff[ , !names(sumdiff) %in% c('register', 'mean_scaled', 'mean_raw')]
+          
+          print(paste(m, h, sep = ', '))
+          print(kable(sumdiff, format = 'markdown', digits = 2))
+        }
+      } else if (m == 'H1H2c') {
+        
+          sumest <- ef_graph[[paste(m, sep = '_')]] %>%
+              group_by(gender, TLE, register) %>%
+              summarize(mean_scaled = mean(fit),
+                        mean_raw = mean(get(raw)))
+          
+          sumdiff <- sumest[sumest$register == 'modal', ]
+          
+          sumdiff$mbdiff_raw <- sumdiff$mean_raw - sumest[sumest$register == 'breathy', ]$mean_raw
+          
+          sumdiff$mbdiff_scaled <- sumdiff$mean_scaled - sumest[sumest$register == 'breathy', ]$mean_scaled
+          
+          sumdiff <- sumdiff[ , !names(sumdiff) %in% c('register', 'mean_scaled', 'mean_raw')]
+          
+          print(m)
+          print(kable(sumdiff, format = 'markdown', digits = 2))
+          
+      } else {
+        
+        for (g in c('f', 'm')) {
+        
+          sumest <- ef_graph[[paste(m, g, sep = '_')]] %>%
+          group_by(gender, TLE, away, register) %>%
+          summarize(mean_scaled = mean(fit),
+              mean_raw = mean(get(raw)))
+          
+          sumdiff <- sumest[sumest$register == 'modal', ]
+        
+          sumdiff$mbdiff_raw <- sumdiff$mean_raw - sumest[sumest$register == 'breathy', ]$mean_raw
+          
+          sumdiff$mbdiff_scaled <- sumdiff$mean_scaled - sumest[sumest$register == 'breathy', ]$mean_scaled
+          
+          sumdiff <- sumdiff[ , !names(sumdiff) %in% c('register', 'mean_scaled', 'mean_raw')]
+  
+          print(paste(m, g, sep = ', '))        
+          print(kable(sumdiff, format = 'markdown', digits = 2))
+          
+      }
+        
+      sumdiff <- sumest[sumest$register == 'modal', ]
+      
+      sumdiff$mbdiff_raw <- sumdiff$mean_raw - sumest[sumest$register == 'breathy', ]$mean_raw
+      
+      sumdiff$mbdiff_scaled <- sumdiff$mean_scaled - sumest[sumest$register == 'breathy', ]$mean_scaled
+      
+      sumdiff <- sumdiff[ , !names(sumdiff) %in% c('register', 'mean_scaled', 'mean_raw')]
+
+      print(paste(m, g, sep = ', '))        
+      print(kable(sumdiff, format = 'markdown', digits = 2))
+  
+    }
+  }
+} else {
+  raw <- ifelse(substr(m, 0, 2) %in% c('f0', 'F1'), 'fit_raw_Hz', 'fit_raw')
+  
+  # Consider height if F1
+  if (grepl('F1', m, fixed = TRUE)) {
+    sumest <- ef_graph[[paste0(m, g, h)]] %>%
+      group_by(gender, TLE, register) %>%
+      summarize(mean_scaled = mean(fit),
+                mean_raw = mean(get(raw)))
+  } else if (m == 'H1H2c') {
+    sumest <- ef_graph[[paste0(m, g)]] %>%
+      group_by(gender, TLE, register) %>%
+      summarize(mean_scaled = mean(fit),
+                mean_raw = mean(get(raw)))
+  } else {
+    sumest <- ef_graph[[paste0(m, g)]] %>%
+      group_by(gender, TLE, away, register) %>%
+      summarize(mean_scaled = mean(fit),
+                mean_raw = mean(get(raw)))
+  }
+  
+  sumdiff <- sumest[sumest$register == 'modal', ]
+  
+  sumdiff$mbdiff_raw <- sumdiff$mean_raw - sumest[sumest$register == 'breathy', ]$mean_raw
+  
+  sumdiff$mbdiff_scaled <- sumdiff$mean_scaled - sumest[sumest$register == 'breathy', ]$mean_scaled
+  
+  sumdiff <- sumdiff[ , !names(sumdiff) %in% c('register', 'mean_scaled', 'mean_raw')]
+  
+  print(paste(m, g, h, sep = ', '))
+  print(kable(sumdiff, format = 'markdown', digits = 2))
+}
+```
