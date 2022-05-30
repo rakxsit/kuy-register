@@ -41,3 +41,10 @@ This folder contains the workflows for organizing and annotating the files for e
 
 ### experiment
 
+This folder contains the experiments presented to the participants--taq-first is the condition in which taq is presented first, while tii-first is the condition in which tii is presented first
+
+### stimuli
+
+- The stimuli_kuy files include the Praat scripts used to synthesize the taq and tii continua
+- taq and tii contain the synthesized taq and tii tokens and the VoiceSauce analyses, as well as results of the analysis from synthesis_explore.ipynb
+- synthesis_explore.ipynb is the analysis of the acoustic measures for each synthesized token
